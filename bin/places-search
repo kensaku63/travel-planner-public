@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""places-search — Google Places API (New) で場所/アクティビティ/店を検索
+
+公式 Places API (New) を使う。APIキーは環境変数 GOOGLE_MAPS_API_KEY から読む。
+環境変数で設定する想定:
+  places-search search "京都 抹茶 カフェ"
+
+サブコマンド:
+  search   テキスト検索 (Text Search)。自由文で店/施設/アクティビティを探す
+  nearby   近接検索 (Nearby Search)。座標中心の半径内をタイプ指定で探す
+  details  詳細取得 (Place Details)。place_id から営業時間/口コミ/連絡先まで
+
+例:
+  places-search search "金沢 寿司" --open-now --min-rating 4.0
+  places-search search "美術館" --lat 35.71 --lng 139.77 --radius 3000
+  places-search nearby --lat 34.99 --lng 135.78 --radius 800 --type restaurant
+  places-search details ChIJ... --json
+
+コスト制御: FieldMask で必要フィールドだけ要求する。search/nearby は
+rating/価格帯まで(Pro SKU 相当)、口コミ本文や全営業時間は details でのみ取得。
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+BASE = "https://places.googleapis.com/v1"
+
+# search / nearby が返すフィールド（コスト最小化のため絞る）
+LIST_FIELDS = ",".join([
+    "places.id",
+    "places.displayName",
+    "places.formattedAddress",
+    "places.rating",
+    "places.userRatingCount",
+    "places.priceLevel",
+    "places.primaryTypeDisplayName",
+    "places.currentOpeningHours.openNow",
+    "places.location",
+    "places.googleMapsUri",
+])
+
+# details が返すフィールド（詳細表示用、口コミ/営業時間/連絡先を含む）
+DETAIL_FIELDS = ",".join([
+    "id",
+    "displayName",
+    "formattedAddress",
+    "rating",
+    "userRatingCount",
+    "priceLevel",
+    "primaryTypeDisplayName",
+    "internationalPhoneNumber",
+    "websiteUri",
+    "googleMapsUri",
+    "regularOpeningHours.weekdayDescriptions",
+    "currentOpeningHours.openNow",
+    "editorialSummary",
+    "reviews",
+    "location",
+])
+
+PRICE = {
+    "PRICE_LEVEL_FREE": "無料",
+    "PRICE_LEVEL_INEXPENSIVE": "¥",
+    "PRICE_LEVEL_MODERATE": "¥¥",
+    "PRICE_LEVEL_EXPENSIVE": "¥¥¥",
+    "PRICE_LEVEL_VERY_EXPENSIVE": "¥¥¥¥",
+}
+
+
+def api_key() -> str:
+    key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not key:
+        sys.stderr.write(
+            "GOOGLE_MAPS_API_KEY が未設定です。利用者自身の環境変数を設定してください。\n")
+        sys.exit(1)
+    return key
+
+
+def call(method: str, path: str, field_mask: str, body: dict | None) -> dict:
+    url = f"{BASE}/{path}"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key(),
+        "X-Goog-FieldMask": field_mask,
+    }
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        sys.stderr.write(f"Places API error {e.code}: {detail}\n")
+        sys.exit(2)
+
+
+def fmt_price(p):
+    return PRICE.get(p, "")
+
+
+def print_place(pl: dict) -> None:
+    name = (pl.get("displayName") or {}).get("text", "?")
+    typ = (pl.get("primaryTypeDisplayName") or {}).get("text", "")
+    rating = pl.get("rating", "?")
+    cnt = pl.get("userRatingCount", "?")
+    price = fmt_price(pl.get("priceLevel", ""))
+    addr = pl.get("formattedAddress", "")
+    openinfo = ""
+    coh = pl.get("currentOpeningHours")
+    if isinstance(coh, dict) and "openNow" in coh:
+        openinfo = " | 営業中" if coh["openNow"] else " | 営業時間外"
+    head = f"- {name}"
+    if typ:
+        head += f"  [{typ}]"
+    if price:
+        head += f"  {price}"
+    print(head)
+    print(f"  ★{rating} ({cnt} reviews){openinfo}")
+    if addr:
+        print(f"  {addr}")
+    if pl.get("googleMapsUri"):
+        print(f"  {pl['googleMapsUri']}")
+
+
+def cmd_search(args) -> None:
+    body = {
+        "textQuery": args.query,
+        "languageCode": args.lang,
+        "regionCode": args.region,
+        "maxResultCount": args.max,
+    }
+    if args.open_now:
+        body["openNow"] = True
+    if args.min_rating is not None:
+        body["minRating"] = args.min_rating
+    if args.type:
+        body["includedType"] = args.type
+    if args.lat is not None and args.lng is not None:
+        body["locationBias"] = {
+            "circle": {
+                "center": {"latitude": args.lat, "longitude": args.lng},
+                "radius": float(args.radius),
+            }
+        }
+    data = call("POST", "places:searchText", LIST_FIELDS, body)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    places = data.get("places", [])
+    print(f"{len(places)} 件\n")
+    for pl in places:
+        print_place(pl)
+
+
+def cmd_nearby(args) -> None:
+    body = {
+        "languageCode": args.lang,
+        "regionCode": args.region,
+        "maxResultCount": args.max,
+        "locationRestriction": {
+            "circle": {
+                "center": {"latitude": args.lat, "longitude": args.lng},
+                "radius": float(args.radius),
+            }
+        },
+    }
+    if args.type:
+        body["includedTypes"] = [args.type]
+    if args.rank_distance:
+        body["rankPreference"] = "DISTANCE"
+    data = call("POST", "places:searchNearby", LIST_FIELDS, body)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    places = data.get("places", [])
+    print(f"{len(places)} 件\n")
+    for pl in places:
+        print_place(pl)
+
+
+def cmd_details(args) -> None:
+    pid = args.place_id
+    if pid.startswith("places/"):
+        pid = pid.split("/", 1)[1]
+    data = call("GET", f"places/{pid}?languageCode={args.lang}",
+                DETAIL_FIELDS, None)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    name = (data.get("displayName") or {}).get("text", "?")
+    typ = (data.get("primaryTypeDisplayName") or {}).get("text", "")
+    print(f"{name}  [{typ}]")
+    print(f"★{data.get('rating','?')} ({data.get('userRatingCount','?')} reviews)"
+          f"  {fmt_price(data.get('priceLevel',''))}")
+    if data.get("formattedAddress"):
+        print(data["formattedAddress"])
+    if data.get("internationalPhoneNumber"):
+        print(f"TEL {data['internationalPhoneNumber']}")
+    if data.get("websiteUri"):
+        print(data["websiteUri"])
+    if data.get("googleMapsUri"):
+        print(data["googleMapsUri"])
+    summ = (data.get("editorialSummary") or {}).get("text")
+    if summ:
+        print(f"\n{summ}")
+    roh = data.get("regularOpeningHours") or {}
+    for line in roh.get("weekdayDescriptions", []) or []:
+        print(line)
+    reviews = data.get("reviews", []) or []
+    if reviews:
+        print("\n--- 口コミ ---")
+        for r in reviews[:5]:
+            star = r.get("rating", "?")
+            txt = (r.get("text") or {}).get("text", "").strip().replace("\n", " ")
+            if len(txt) > 200:
+                txt = txt[:200] + "…"
+            print(f"★{star}: {txt}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Google Places API (New) 検索")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    common_lang = dict(help=None)
+
+    s = sub.add_parser("search", help="テキスト検索 (Text Search)")
+    s.add_argument("query", help="自由文クエリ (例: '金沢 寿司')")
+    s.add_argument("--lat", type=float, help="位置バイアス中心 緯度")
+    s.add_argument("--lng", type=float, help="位置バイアス中心 経度")
+    s.add_argument("--radius", type=float, default=5000, help="半径m (既定5000)")
+    s.add_argument("--type", help="includedType (例: restaurant, cafe, museum)")
+    s.add_argument("--open-now", action="store_true", dest="open_now")
+    s.add_argument("--min-rating", type=float, dest="min_rating",
+                   help="最低評価 0.0-5.0")
+    s.add_argument("--max", type=int, default=10, help="最大件数 (1-20)")
+    s.add_argument("--lang", default="ja")
+    s.add_argument("--region", default="JP")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_search)
+
+    n = sub.add_parser("nearby", help="近接検索 (Nearby Search)")
+    n.add_argument("--lat", type=float, required=True)
+    n.add_argument("--lng", type=float, required=True)
+    n.add_argument("--radius", type=float, default=1000, help="半径m (既定1000)")
+    n.add_argument("--type", help="includedTypes の1つ (例: restaurant)")
+    n.add_argument("--rank-distance", action="store_true", dest="rank_distance",
+                   help="距離順 (既定は関連度順)")
+    n.add_argument("--max", type=int, default=10)
+    n.add_argument("--lang", default="ja")
+    n.add_argument("--region", default="JP")
+    n.add_argument("--json", action="store_true")
+    n.set_defaults(func=cmd_nearby)
+
+    d = sub.add_parser("details", help="詳細取得 (Place Details)")
+    d.add_argument("place_id", help="place_id (ChIJ... または places/ChIJ...)")
+    d.add_argument("--lang", default="ja")
+    d.add_argument("--json", action="store_true")
+    d.set_defaults(func=cmd_details)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

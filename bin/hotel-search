@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""hotel-search — SerpAPI (Google Hotels) でホテル検索
+
+APIキーは環境変数 SERP_API_KEY から読む。環境変数で設定する想定:
+  hotel-search "Kyoto" \
+      --checkin 2026-07-01 --checkout 2026-07-03 --adults 2
+
+例:
+  hotel-search "Kyoto, Japan" --checkin 2026-07-01 --checkout 2026-07-03 --adults 2
+  hotel-search "Kyoto" --max-price 200 --currency JPY --gl jp --hl ja --json
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+ENDPOINT = "https://serpapi.com/search.json"
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Google Hotels 検索 (SerpAPI)")
+    p.add_argument("q", help="検索クエリ (都市・エリア・ホテル名など)")
+    p.add_argument("--checkin", required=True, help="YYYY-MM-DD")
+    p.add_argument("--checkout", required=True, help="YYYY-MM-DD")
+    p.add_argument("--adults", type=int, default=2)
+    p.add_argument("--children", type=int, default=0)
+    p.add_argument("--min-price", type=int, dest="min_price")
+    p.add_argument("--max-price", type=int, dest="max_price")
+    p.add_argument("--currency", default="JPY")
+    p.add_argument("--gl", default="jp", help="国コード")
+    p.add_argument("--hl", default="ja", help="言語")
+    p.add_argument("--sort", choices=["3", "8", "13"],
+                   help="3=低価格 8=高評価 13=レビュー数")
+    p.add_argument("--json", action="store_true", help="生のJSONを出力")
+    args = p.parse_args()
+
+    key = os.environ.get("SERP_API_KEY")
+    if not key:
+        sys.stderr.write(
+            "SERP_API_KEY が未設定です。利用者自身の環境変数を設定してください。\n")
+        sys.exit(1)
+
+    params = {
+        "engine": "google_hotels",
+        "q": args.q,
+        "check_in_date": args.checkin,
+        "check_out_date": args.checkout,
+        "adults": args.adults,
+        "children": args.children,
+        "currency": args.currency,
+        "gl": args.gl,
+        "hl": args.hl,
+        "api_key": key,
+    }
+    if args.min_price is not None:
+        params["min_price"] = args.min_price
+    if args.max_price is not None:
+        params["max_price"] = args.max_price
+    if args.sort:
+        params["sort_by"] = args.sort
+
+    url = ENDPOINT + "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        data = json.loads(resp.read().decode())
+
+    if "error" in data:
+        sys.stderr.write("SerpAPI error: " + data["error"] + "\n")
+        sys.exit(2)
+
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+
+    props = data.get("properties", [])
+    print(f"{len(props)} 件\n")
+    for h in props:
+        rate = (h.get("rate_per_night", {}) or {}).get("lowest", "?")
+        total = (h.get("total_rate", {}) or {}).get("lowest", "?")
+        rating = h.get("overall_rating", "?")
+        reviews = h.get("reviews", "?")
+        cls = h.get("hotel_class", "")
+        print(f"- {h.get('name','?')}  [{h.get('type','')}] {cls}")
+        print(f"  {rate}/泊 (合計 {total}) | ★{rating} ({reviews} reviews)")
+        if h.get("link"):
+            print(f"  {h['link']}")
+
+
+if __name__ == "__main__":
+    main()

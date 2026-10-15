@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""trip-map-build — 行程 JSON からブラウザで開ける行程地図 HTML を生成
+
+Maps JavaScript API を使い、日別マーカー(色分け)・日内ルート線・到達圏(Isochrone)
+ポリゴンを 1 枚の地図に描く。出力は aachat/html/<team>/<project>/index.html に置く想定。
+APIキー(GOOGLE_MAPS_BROWSER_API_KEY)は生成時に HTML へ埋め込まれる(公開先の HTTP リファラーと Maps JavaScript API に制限したブラウザ専用キー)。
+
+入力 JSON（--in path または stdin）:
+{
+  "title": "京都2泊3日",
+  "center": {"lat": 35.01, "lng": 135.77},   // 省略時は全点の重心
+  "zoom": 12,
+  "days": [
+    {"label": "Day1", "color": "#e74c3c",
+     "points": [{"name": "清水寺", "lat": 34.9949, "lng": 135.785, "note": "朝イチ"}]}
+  ],
+  "isochrones": [                              // 省略可。利用者が用意した GeoJSON を貼る
+    {"label": "宿から徒歩15分", "color": "#3388ff", "geojson": { ... }}
+  ]
+}
+
+例:
+  trip-map-build --in trip.json --out index.html --title "京都3日間"
+"""
+import argparse
+import json
+import os
+import sys
+
+PALETTE = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#e67e22"]
+
+
+def downloads_html(kml: str = "", csv: str = "") -> str:
+    """凡例内に「Google マップ(マイマップ)に保存」のダウンロード導線を作る。
+
+    kml/csv は HTML から見た相対パス（同階層のファイル名など）。trip-kml で生成した
+    成果物を index.html の隣に置き、ここにリンクすると目視→保存まで 1 画面で完結する。
+    """
+    if not (kml or csv):
+        return ""
+    links = []
+    if kml:
+        links.append(f'<a href="{kml}" download>📍 KML</a>')
+    if csv:
+        links.append(f'<a href="{csv}" download>CSV</a>')
+    return (
+        '<div id="dl"><b>Google マップに保存</b><br>'
+        + " / ".join(links)
+        + "<details><summary>取り込み手順</summary><ol>"
+        "<li><a href=\"https://www.google.com/mymaps\" target=\"_blank\" rel=\"noopener\">マイマップ</a>で新規地図を作成</li>"
+        "<li>レイヤの「インポート」→ KML を選択</li>"
+        "<li>Google マップアプリの「保存 → マイマップ」で閲覧</li>"
+        "</ol></details></div>"
+    )
+
+
+def api_key() -> str:
+    key = os.environ.get("GOOGLE_MAPS_BROWSER_API_KEY")
+    if not key:
+        sys.stderr.write("GOOGLE_MAPS_BROWSER_API_KEY が未設定です。利用者自身の環境変数を設定してください。\n")
+        sys.exit(1)
+    return key
+
+
+HTML = """<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  html,body{{height:100%;margin:0;font-family:system-ui,-apple-system,"Hiragino Kaku Gothic ProN",sans-serif}}
+  #map{{height:100%}}
+  #legend{{position:absolute;top:10px;left:10px;background:#fff;padding:10px 14px;
+    border-radius:8px;box-shadow:0 1px 6px rgba(0,0,0,.3);font-size:13px;z-index:5;max-width:240px}}
+  #legend h1{{font-size:15px;margin:0 0 6px}}
+  .row{{display:flex;align-items:center;margin:2px 0}}
+  .sw{{width:12px;height:12px;border-radius:50%;margin-right:6px;flex:0 0 auto}}
+  #dl{{margin-top:8px;padding-top:8px;border-top:1px solid #eee;font-size:12px;line-height:1.5}}
+  #dl b{{font-size:12px}}
+  #dl a{{color:#1a73e8;text-decoration:none;font-weight:600}}
+  #dl details{{margin-top:4px}} #dl summary{{cursor:pointer;color:#666}}
+  #dl ol{{margin:4px 0 0;padding-left:18px;color:#555}}
+</style>
+</head><body>
+<div id="legend"><h1>{title}</h1><div id="legend-body"></div>{downloads}</div>
+<div id="map"></div>
+<script>
+const TRIP = {trip_json};
+function initMap() {{
+  const all = [];
+  TRIP.days.forEach(d => d.points.forEach(p => all.push(p)));
+  const center = TRIP.center || (all.length
+    ? {{lat: all.reduce((s,p)=>s+p.lat,0)/all.length, lng: all.reduce((s,p)=>s+p.lng,0)/all.length}}
+    : {{lat:35.68,lng:139.76}});
+  const map = new google.maps.Map(document.getElementById("map"), {{
+    center, zoom: TRIP.zoom || 12, mapTypeControl: false, streetViewControl: false
+  }});
+  const lb = document.getElementById("legend-body");
+  const info = new google.maps.InfoWindow();
+  const palette = {palette};
+
+  (TRIP.isochrones || []).forEach((iso, i) => {{
+    const color = iso.color || "#3388ff";
+    map.data.addGeoJson(iso.geojson);
+    map.data.setStyle({{fillColor: color, fillOpacity: 0.12, strokeColor: color, strokeWeight: 1.5}});
+    const r = document.createElement("div"); r.className = "row";
+    r.innerHTML = `<span class="sw" style="background:${{color}};border-radius:2px"></span>${{iso.label||"到達圏"}}`;
+    lb.appendChild(r);
+  }});
+
+  TRIP.days.forEach((d, di) => {{
+    const color = d.color || palette[di % palette.length];
+    const path = [];
+    d.points.forEach((p, pi) => {{
+      const pos = {{lat: p.lat, lng: p.lng}};
+      path.push(pos);
+      const m = new google.maps.Marker({{
+        position: pos, map, label: {{text: String(pi+1), color: "#fff", fontSize: "11px"}},
+        title: p.name,
+        icon: {{path: google.maps.SymbolPath.CIRCLE, scale: 11, fillColor: color,
+          fillOpacity: 1, strokeColor: "#fff", strokeWeight: 2}}
+      }});
+      m.addListener("click", () => {{
+        info.setContent(`<b>${{p.name||""}}</b><br>${{d.label||""}} #${{pi+1}}` +
+          (p.note ? `<br>${{p.note}}` : ""));
+        info.open(map, m);
+      }});
+    }});
+    if (path.length > 1) {{
+      new google.maps.Polyline({{path, map, strokeColor: color, strokeOpacity: 0.8, strokeWeight: 3}});
+    }}
+    const r = document.createElement("div"); r.className = "row";
+    r.innerHTML = `<span class="sw" style="background:${{color}}"></span>${{d.label||("Day"+(di+1))}} (${{d.points.length}})`;
+    lb.appendChild(r);
+  }});
+}}
+window.initMap = initMap;
+</script>
+<script async src="https://maps.googleapis.com/maps/api/js?key={key}&callback=initMap"></script>
+</body></html>
+"""
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="行程地図 HTML 生成 (Maps JavaScript API)")
+    p.add_argument("--in", dest="infile", help="行程 JSON ファイル (省略時 stdin)")
+    p.add_argument("--out", help="出力 HTML パス (省略時 stdout)")
+    p.add_argument("--title", help="タイトル上書き")
+    p.add_argument("--kml-link", help="凡例に出す KML ダウンロードリンク（HTML から見た相対パス）")
+    p.add_argument("--csv-link", help="凡例に出す CSV ダウンロードリンク（HTML から見た相対パス）")
+    args = p.parse_args()
+
+    raw = open(args.infile, encoding="utf-8").read() if args.infile else sys.stdin.read()
+    trip = json.loads(raw)
+    if args.title:
+        trip["title"] = args.title
+    trip.setdefault("title", "Trip Map")
+    trip.setdefault("days", [])
+
+    html = HTML.format(
+        title=trip["title"],
+        trip_json=json.dumps(trip, ensure_ascii=False),
+        palette=json.dumps(PALETTE),
+        key=api_key(),
+        downloads=downloads_html(args.kml_link or "", args.csv_link or ""),
+    )
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(html)
+        sys.stderr.write(f"生成: {args.out}\n")
+    else:
+        sys.stdout.write(html)
+
+
+if __name__ == "__main__":
+    main()

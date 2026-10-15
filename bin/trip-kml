@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""trip-kml — 行程 JSON を Google マイマップ用の KML / CSV へ変換
+
+ユーザーがいつも使う Google マップ（消費者版）の「保存リスト（スター/行きたい場所/
+カスタムリスト）」には、外部から書き込む公式 API が存在しない（Google Issue Tracker
+#453378725 / #68749469 で未実装の要望扱い）。プログラムから地図に載せる唯一の正規ルートは
+**Google マイマップ（mymaps.google.com）へのインポート**で、作ったカスタム地図は
+Google マップアプリの「保存 → マイマップ」で閲覧できる。
+
+このツールは trip-map と同じ trip JSON を入力に、ワンクリックでインポートできる
+KML（日別フォルダ・色分けピン）と CSV を生成する。API キー不要（純粋な変換）。
+
+入力 JSON（trip-map と共通。--in path または stdin）:
+{
+  "title": "京都旅行",
+  "days": [
+    {"label": "Day1", "color": "#e74c3c",
+     "points": [{"name": "京都駅", "lat": 34.9858, "lng": 135.7588, "note": "集合"}]}
+  ]
+}
+
+例:
+  trip-kml --in trip.json --out spots.kml                 # KML（既定, 単一ファイル）
+  trip-kml --in trip.json --kml spots.kml --csv spots.csv # KML と CSV を同時出力
+  trip-kml --in trip.json --csv-split out/               # 日ごとに CSV を分割（=マイマップの層別）
+
+マイマップへの取り込み手順:
+  1. https://www.google.com/mymaps で「新しい地図を作成」
+  2. レイヤの「インポート」→ 生成した .kml（または .csv）を選択
+     - CSV の場合は「緯度/経度」列と「タイトル」列を指定
+  3. 共有/閲覧は Google マップアプリ「保存 → マイマップ」から
+"""
+import argparse
+import csv
+import io
+import json
+import os
+import sys
+from xml.sax.saxutils import escape
+
+PALETTE = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#e67e22"]
+
+# Google mapfiles の shape アイコン（マイマップが取り込み時に認識する公開 PNG）。
+# day["icon"] にこのキーワード（または http で始まる任意 URL）を入れるとピンに焼ける。
+# 省略時は色付き paddle（白地を色でティント）にフォールバック。
+SHAPE_BASE = "http://maps.google.com/mapfiles/kml/shapes/"
+ICONS = {
+    "home": "ranger_station", "lodging": "lodging", "hotel": "lodging",
+    "bar": "bars", "party": "bars", "nightlife": "bars", "event": "arts",
+    "music": "arts", "theater": "arts",
+    "spa": "swimming", "sauna": "swimming", "wellness": "swimming", "onsen": "swimming",
+    "cannabis": "parks", "weed": "parks", "leaf": "parks", "nature": "parks", "park": "parks",
+    "cafe": "coffee", "coffee": "coffee", "juice": "coffee",
+    "food": "dining", "dining": "dining", "restaurant": "dining",
+    "shopping": "shopping", "shop": "shopping", "store": "shopping",
+    "camera": "camera", "photo": "camera", "sights": "camera",
+    "star": "star", "info": "info-i", "flag": "flag", "parking": "parking_lot",
+}
+DEFAULT_PADDLE = "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
+
+
+def resolve_icon(day: dict) -> str:
+    """day["icon"] を mapfiles の href へ解決。http 直指定はそのまま。未指定は paddle。"""
+    ic = (day.get("icon") or "").strip()
+    if not ic:
+        return DEFAULT_PADDLE
+    if ic.startswith("http"):
+        return ic
+    name = ICONS.get(ic.lower())
+    if name:
+        return f"{SHAPE_BASE}{name}.png"
+    return DEFAULT_PADDLE
+
+
+def hex_to_kml_color(hex_color: str, alpha: str = "ff") -> str:
+    """#RRGGBB → KML の aabbggrr。不正値は赤にフォールバック。"""
+    h = (hex_color or "").lstrip("#").strip()
+    if len(h) != 6:
+        h = "e74c3c"
+    rr, gg, bb = h[0:2], h[2:4], h[4:6]
+    return f"{alpha}{bb}{gg}{rr}".lower()
+
+
+def iter_days(trip: dict):
+    for di, day in enumerate(trip.get("days", [])):
+        color = day.get("color") or PALETTE[di % len(PALETTE)]
+        label = day.get("label") or f"Day{di + 1}"
+        yield di, label, color, resolve_icon(day), day.get("points", [])
+
+
+def _icon_style(kc: str, icon: str, scale: float) -> str:
+    return (
+        "    <IconStyle>\n"
+        f"      <color>{kc}</color>\n"
+        f"      <scale>{scale}</scale>\n"
+        f"      <Icon><href>{escape(icon)}</href></Icon>\n"
+        "    </IconStyle>\n"
+        f"    <LabelStyle><color>{kc}</color></LabelStyle>\n"
+    )
+
+
+def build_kml(trip: dict) -> str:
+    title = trip.get("title", "Trip Map")
+    out = io.StringIO()
+    out.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+    out.write('<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n')
+    out.write(f"  <name>{escape(title)}</name>\n")
+
+    # 日(カテゴリ)ごとの色付き＋アイコン付きスタイル。StyleMap(normal/highlight)で
+    # 包むことで、マイマップ取り込み時に「均一スタイル」へ落とされず個別スタイルが残りやすい。
+    for di, label, color, icon, _pts in iter_days(trip):
+        kc = hex_to_kml_color(color)
+        out.write(f'  <Style id="day{di}-n">\n{_icon_style(kc, icon, 1.1)}  </Style>\n')
+        out.write(f'  <Style id="day{di}-h">\n{_icon_style(kc, icon, 1.3)}  </Style>\n')
+        out.write(f'  <StyleMap id="day{di}">\n')
+        out.write(f"    <Pair><key>normal</key><styleUrl>#day{di}-n</styleUrl></Pair>\n")
+        out.write(f"    <Pair><key>highlight</key><styleUrl>#day{di}-h</styleUrl></Pair>\n")
+        out.write("  </StyleMap>\n")
+
+    for di, label, color, icon, pts in iter_days(trip):
+        out.write("  <Folder>\n")
+        out.write(f"    <name>{escape(label)}</name>\n")
+        for p in pts:
+            try:
+                lat = float(p["lat"])
+                lng = float(p["lng"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            name = escape(str(p.get("name", "")))
+            note = str(p.get("note", "")).strip()
+            out.write("    <Placemark>\n")
+            out.write(f"      <name>{name}</name>\n")
+            if note:
+                out.write(f"      <description>{escape(note)}</description>\n")
+            out.write(f"      <styleUrl>#day{di}</styleUrl>\n")
+            out.write(f"      <Point><coordinates>{lng},{lat},0</coordinates></Point>\n")
+            out.write("    </Placemark>\n")
+        out.write("  </Folder>\n")
+
+    out.write("</Document>\n</kml>\n")
+    return out.getvalue()
+
+
+def build_csv_rows(trip: dict):
+    rows = []
+    for _di, label, _color, _icon, pts in iter_days(trip):
+        for p in pts:
+            try:
+                lat = float(p["lat"])
+                lng = float(p["lng"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows.append(
+                {
+                    "name": str(p.get("name", "")),
+                    "latitude": f"{lat:.7f}",
+                    "longitude": f"{lng:.7f}",
+                    "layer": label,
+                    "note": str(p.get("note", "")).strip(),
+                }
+            )
+    return rows
+
+
+def write_csv(path_or_stream, rows) -> None:
+    fields = ["name", "latitude", "longitude", "layer", "note"]
+    if hasattr(path_or_stream, "write"):
+        w = csv.DictWriter(path_or_stream, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+        return
+    with open(path_or_stream, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def slugify(label: str, idx: int) -> str:
+    keep = [c if (c.isalnum() or c in "-_") else "-" for c in label]
+    s = "".join(keep).strip("-")
+    # 非 ASCII（日本語/絵文字）は落ちるので番号でフォールバック
+    s = "".join(c for c in s if ord(c) < 128).strip("-")
+    return s.lower() or f"day{idx + 1}"
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="行程 JSON → Google マイマップ用 KML / CSV")
+    p.add_argument("--in", dest="infile", help="行程 JSON ファイル（省略時 stdin）")
+    p.add_argument("--out", help="KML 出力パス（既定の出力。--kml の別名）")
+    p.add_argument("--kml", help="KML 出力パス")
+    p.add_argument("--csv", dest="csvfile", help="CSV 出力パス（マイマップ Import data 用）")
+    p.add_argument("--csv-split", help="日ごとに CSV を分割出力するディレクトリ（マイマップの層別に対応）")
+    p.add_argument("--title", help="タイトル上書き")
+    args = p.parse_args()
+
+    raw = open(args.infile, encoding="utf-8").read() if args.infile else sys.stdin.read()
+    trip = json.loads(raw)
+    if args.title:
+        trip["title"] = args.title
+
+    kml_path = args.kml or args.out
+    wrote_any = False
+
+    if args.csvfile:
+        write_csv(args.csvfile, build_csv_rows(trip))
+        sys.stderr.write(f"生成(CSV): {args.csvfile}\n")
+        wrote_any = True
+
+    if args.csv_split:
+        os.makedirs(args.csv_split, exist_ok=True)
+        used = set()
+        for di, label, _color, _icon, pts in iter_days(trip):
+            slug = slugify(label, di)
+            base, n = slug, 1
+            while slug in used:
+                n += 1
+                slug = f"{base}-{n}"
+            used.add(slug)
+            rows = []
+            for q in pts:
+                try:
+                    lat, lng = float(q["lat"]), float(q["lng"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                rows.append(
+                    {
+                        "name": str(q.get("name", "")),
+                        "latitude": f"{lat:.7f}",
+                        "longitude": f"{lng:.7f}",
+                        "layer": label,
+                        "note": str(q.get("note", "")).strip(),
+                    }
+                )
+            path = os.path.join(args.csv_split, f"{di + 1:02d}-{slug}.csv")
+            write_csv(path, rows)
+            sys.stderr.write(f"生成(CSV分割): {path}\n")
+        wrote_any = True
+
+    # KML は明示指定があるか、CSV を一切出していなければ既定で出す
+    if kml_path or not wrote_any:
+        kml = build_kml(trip)
+        if kml_path:
+            with open(kml_path, "w", encoding="utf-8") as f:
+                f.write(kml)
+            sys.stderr.write(f"生成(KML): {kml_path}\n")
+        else:
+            sys.stdout.write(kml)
+
+
+if __name__ == "__main__":
+    main()

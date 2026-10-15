@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""gmail-impl — Gmail API (OAuth2) でメッセージの検索/読取/送信/返信を行う
+
+公式 Gmail REST API を urllib 直叩きで使う。秘密情報は環境変数から読む（利用者自身が設定）:
+  GMAIL_OAUTH_CLIENT_ID      OAuth クライアント ID
+  GMAIL_OAUTH_CLIENT_SECRET  OAuth クライアントシークレット
+  GMAIL_OAUTH_REFRESH_TOKEN  リフレッシュトークン（auth サブコマンドで一度だけ発行）
+
+scope（最小権限）: gmail.send + gmail.readonly のみ。delete/modify は要求しない。
+
+サブコマンド:
+  auth     OAuth ループバック認証を一度だけ実行し refresh_token を発行（CLIENT_ID/SECRET が必要）
+  list     メッセージ検索（Gmail 検索クエリ `q` をそのまま使える）
+  read     メッセージ本文/ヘッダを取得して表示
+  send     新規メール送信
+  reply    既存メッセージへスレッド返信（In-Reply-To/References/threadId を自動付与）
+
+例:
+  gmail auth
+  gmail list --q "from:boss@example.com is:unread" --max 10
+  gmail read 1920abc...
+  gmail send --to a@example.com --subject "件名" --body "本文" --dry-run
+  gmail reply 1920abc... --body "了解しました。" --dry-run
+"""
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from email.message import EmailMessage
+from email.utils import parseaddr
+
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+API = "https://gmail.googleapis.com/gmail/v1/users/me"
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",
+]
+
+
+def die(msg, code=1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _post_form(url, data):
+    body = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        die(f"HTTP {e.code} {url}\n{detail}")
+
+
+def get_access_token():
+    cid = os.environ.get("GMAIL_OAUTH_CLIENT_ID")
+    csec = os.environ.get("GMAIL_OAUTH_CLIENT_SECRET")
+    rtok = os.environ.get("GMAIL_OAUTH_REFRESH_TOKEN")
+    if not (cid and csec and rtok):
+        die("GMAIL_OAUTH_CLIENT_ID / CLIENT_SECRET / REFRESH_TOKEN が未設定。"
+            " 環境変数を設定するか `gmail auth` で refresh_token を発行してください。")
+    res = _post_form(TOKEN_URL, {
+        "client_id": cid,
+        "client_secret": csec,
+        "refresh_token": rtok,
+        "grant_type": "refresh_token",
+    })
+    return res["access_token"]
+
+
+def api(method, path, access_token, body=None, params=None):
+    url = API + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params, doseq=True)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {access_token}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read().decode()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        die(f"HTTP {e.code} {method} {path}\n{detail}")
+
+
+def b64url(raw_bytes):
+    return base64.urlsafe_b64encode(raw_bytes).decode()
+
+
+def _headers_map(message):
+    out = {}
+    for h in message.get("payload", {}).get("headers", []):
+        out[h["name"].lower()] = h["value"]
+    return out
+
+
+def _extract_body(payload):
+    """text/plain を優先して本文を抜く。無ければ text/html。"""
+    def walk(part):
+        mime = part.get("mimeType", "")
+        body = part.get("body", {})
+        data = body.get("data")
+        if mime == "text/plain" and data:
+            return base64.urlsafe_b64decode(data).decode(errors="replace"), None
+        html = None
+        for sub in part.get("parts", []) or []:
+            plain, h = walk(sub)
+            if plain:
+                return plain, h
+            if h and not html:
+                html = h
+        if mime == "text/html" and data:
+            return None, base64.urlsafe_b64decode(data).decode(errors="replace")
+        return None, html
+    plain, html = walk(payload)
+    return plain or html or ""
+
+
+# ---- auth (OAuth ループバック) ----------------------------------------------
+def cmd_auth(args):
+    import http.server
+    import socketserver
+    import threading
+    import webbrowser
+
+    cid = os.environ.get("GMAIL_OAUTH_CLIENT_ID")
+    csec = os.environ.get("GMAIL_OAUTH_CLIENT_SECRET")
+    if not (cid and csec):
+        die("GMAIL_OAUTH_CLIENT_ID / GMAIL_OAUTH_CLIENT_SECRET が必要です。"
+            " Google Cloud で『デスクトップ』タイプの OAuth クライアントを作り 環境変数を設定してください。")
+
+    captured = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(q)
+            captured.update({k: v[0] for k, v in params.items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            msg = "認証完了。ターミナルに戻ってください。" if "code" in params else "認証に失敗しました。"
+            self.wfile.write(f"<html><body><h2>{msg}</h2></body></html>".encode())
+
+        def log_message(self, *a):
+            pass
+
+    port = args.port or 0
+    httpd = socketserver.TCPServer(("127.0.0.1", port), Handler)
+    actual_port = httpd.server_address[1]
+    redirect_uri = f"http://127.0.0.1:{actual_port}"
+
+    auth_params = {
+        "client_id": cid,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    url = AUTH_URL + "?" + urllib.parse.urlencode(auth_params)
+    print("以下の URL をブラウザで開いて Google アカウントで認可してください:\n", file=sys.stderr)
+    print(url + "\n", file=sys.stderr)
+    print(f"（ローカル {redirect_uri} でリダイレクトを待機中…）", file=sys.stderr)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+    t = threading.Thread(target=httpd.handle_request)
+    t.start()
+    t.join(timeout=300)
+    httpd.server_close()
+
+    if "code" not in captured:
+        die("認可コードを取得できませんでした（タイムアウトまたは拒否）。")
+
+    res = _post_form(TOKEN_URL, {
+        "client_id": cid,
+        "client_secret": csec,
+        "code": captured["code"],
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    })
+    rtok = res.get("refresh_token")
+    if not rtok:
+        die(f"refresh_token が返りませんでした: {json.dumps(res)}")
+    print("\n=== 成功 ===", file=sys.stderr)
+    print("標準出力のトークンを秘密ストアへ保存し、GMAIL_OAUTH_REFRESH_TOKEN として設定してください。ログへ残さないでください。", file=sys.stderr)
+    print(rtok)
+
+
+# ---- list -------------------------------------------------------------------
+def cmd_list(args):
+    tok = get_access_token()
+    params = {"maxResults": args.max}
+    if args.q:
+        params["q"] = args.q
+    res = api("GET", "/messages", tok, params=params)
+    msgs = res.get("messages", [])
+    out = []
+    for m in msgs:
+        full = api("GET", f"/messages/{m['id']}", tok,
+                   params={"format": "metadata",
+                           "metadataHeaders": ["From", "Subject", "Date"]})
+        h = _headers_map(full)
+        out.append({
+            "id": m["id"],
+            "threadId": full.get("threadId"),
+            "from": h.get("from", ""),
+            "subject": h.get("subject", ""),
+            "date": h.get("date", ""),
+            "snippet": full.get("snippet", ""),
+        })
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    else:
+        for o in out:
+            print(f"[{o['id']}] {o['date']}\n  from: {o['from']}\n  subj: {o['subject']}\n  {o['snippet'][:120]}\n")
+
+
+# ---- read -------------------------------------------------------------------
+def cmd_read(args):
+    tok = get_access_token()
+    full = api("GET", f"/messages/{args.id}", tok, params={"format": "full"})
+    h = _headers_map(full)
+    body = _extract_body(full.get("payload", {}))
+    if args.json:
+        print(json.dumps({
+            "id": full["id"], "threadId": full.get("threadId"),
+            "from": h.get("from"), "to": h.get("to"), "cc": h.get("cc"),
+            "subject": h.get("subject"), "date": h.get("date"),
+            "message_id": h.get("message-id"), "body": body,
+        }, ensure_ascii=False, indent=2))
+    else:
+        print(f"From: {h.get('from','')}")
+        print(f"To: {h.get('to','')}")
+        print(f"Date: {h.get('date','')}")
+        print(f"Subject: {h.get('subject','')}")
+        print(f"\n{body}")
+
+
+# ---- send -------------------------------------------------------------------
+def _build_message(to, subject, body, cc=None, bcc=None, headers=None):
+    msg = EmailMessage()
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
+    if bcc:
+        msg["Bcc"] = bcc
+    msg["Subject"] = subject
+    for k, v in (headers or {}).items():
+        msg[k] = v
+    msg.set_content(body)
+    return msg
+
+
+def cmd_send(args):
+    msg = _build_message(args.to, args.subject, args.body, args.cc, args.bcc)
+    if args.dry_run:
+        print("=== DRY-RUN (送信しません) ===")
+        print(msg.as_string())
+        return
+    tok = get_access_token()
+    raw = b64url(msg.as_bytes())
+    res = api("POST", "/messages/send", tok, body={"raw": raw})
+    print(json.dumps({"sent": True, "id": res.get("id"), "threadId": res.get("threadId")},
+                     ensure_ascii=False))
+
+
+# ---- reply ------------------------------------------------------------------
+def cmd_reply(args):
+    tok = get_access_token()
+    orig = api("GET", f"/messages/{args.id}", tok,
+               params={"format": "metadata",
+                       "metadataHeaders": ["From", "To", "Cc", "Subject", "Message-ID", "References"]})
+    h = _headers_map(orig)
+    thread_id = orig.get("threadId")
+    orig_msgid = h.get("message-id", "")
+    # 宛先: --to 指定が無ければ元メールの From に返す
+    to = args.to or parseaddr(h.get("from", ""))[1]
+    if not to:
+        die("返信先を特定できませんでした。--to で明示してください。")
+    subject = h.get("subject", "")
+    if subject and not subject.lower().startswith("re:"):
+        subject = "Re: " + subject
+    refs = (h.get("references", "") + " " + orig_msgid).strip()
+    extra = {"In-Reply-To": orig_msgid, "References": refs}
+    msg = _build_message(to, subject, args.body, args.cc, args.bcc, headers=extra)
+    if args.dry_run:
+        print("=== DRY-RUN (送信しません) ===")
+        print(f"threadId: {thread_id}")
+        print(msg.as_string())
+        return
+    raw = b64url(msg.as_bytes())
+    res = api("POST", "/messages/send", tok, body={"raw": raw, "threadId": thread_id})
+    print(json.dumps({"sent": True, "id": res.get("id"), "threadId": res.get("threadId")},
+                     ensure_ascii=False))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="gmail", description="Gmail API CLI (send/reply/read/list)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pa = sub.add_parser("auth", help="OAuth 認証して refresh_token を発行")
+    pa.add_argument("--port", type=int, default=0, help="ループバックポート（既定: 自動）")
+    pa.set_defaults(func=cmd_auth)
+
+    pl = sub.add_parser("list", help="メッセージ検索")
+    pl.add_argument("--q", help="Gmail 検索クエリ (例: 'from:x is:unread')")
+    pl.add_argument("--max", type=int, default=10)
+    pl.add_argument("--json", action="store_true")
+    pl.set_defaults(func=cmd_list)
+
+    pr = sub.add_parser("read", help="メッセージ取得")
+    pr.add_argument("id")
+    pr.add_argument("--json", action="store_true")
+    pr.set_defaults(func=cmd_read)
+
+    ps = sub.add_parser("send", help="新規送信")
+    ps.add_argument("--to", required=True)
+    ps.add_argument("--subject", required=True)
+    ps.add_argument("--body", required=True)
+    ps.add_argument("--cc")
+    ps.add_argument("--bcc")
+    ps.add_argument("--dry-run", action="store_true")
+    ps.set_defaults(func=cmd_send)
+
+    pp = sub.add_parser("reply", help="スレッド返信")
+    pp.add_argument("id", help="返信元メッセージ ID")
+    pp.add_argument("--body", required=True)
+    pp.add_argument("--to", help="宛先上書き（既定: 元メールの From）")
+    pp.add_argument("--cc")
+    pp.add_argument("--bcc")
+    pp.add_argument("--dry-run", action="store_true")
+    pp.set_defaults(func=cmd_reply)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

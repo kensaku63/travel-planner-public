@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""geo-tz — Google Maps Time Zone API で座標のタイムゾーン/UTCオフセットを取得
+
+APIキーは GOOGLE_MAPS_API_KEY から読む。
+環境変数で設定する想定:
+  geo-tz 35.681 139.767
+
+旅企画での用途: フライト発着の現地時刻整合、時差/到着後スケジュール、現地の
+「いま何時か」判定。timestamp により DST が考慮される。
+
+例:
+  geo-tz 35.681 139.767                       # 現在時刻基準の東京駅
+  geo-tz 21.029 105.852 --at 2026-07-01T03:00 # 指定 UTC 時刻基準（DST 判定用）
+  geo-tz 40.7128 -74.0060 --json
+"""
+import argparse
+import calendar
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+BASE = "https://maps.googleapis.com/maps/api/timezone/json"
+
+
+def api_key() -> str:
+    key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not key:
+        sys.stderr.write(
+            "GOOGLE_MAPS_API_KEY が未設定です。利用者自身の環境変数を設定してください。\n")
+        sys.exit(1)
+    return key
+
+
+def resolve_ts(args) -> int:
+    if args.ts is not None:
+        return int(args.ts)
+    if args.at:
+        # --at は UTC の素朴な ISO8601（例 2026-07-01T03:00）として解釈
+        s = args.at.replace("Z", "")
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            sys.stderr.write(f"--at を解釈できません: {args.at} (例 2026-07-01T03:00)\n")
+            sys.exit(1)
+        dt = dt.replace(tzinfo=timezone.utc)
+        return calendar.timegm(dt.utctimetuple())
+    return int(time.time())
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Google Maps Time Zone API")
+    p.add_argument("lat", type=float)
+    p.add_argument("lng", type=float)
+    p.add_argument("--at", help="基準時刻 UTC ISO8601 (例 2026-07-01T03:00)")
+    p.add_argument("--ts", type=int, help="基準時刻 UNIX 秒 (--at より優先)")
+    p.add_argument("--lang", default="ja")
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args()
+
+    ts = resolve_ts(args)
+    q = urllib.parse.urlencode({
+        "location": f"{args.lat},{args.lng}",
+        "timestamp": ts,
+        "language": args.lang,
+        "key": api_key(),
+    })
+    req = urllib.request.Request(f"{BASE}?{q}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        sys.stderr.write(f"Time Zone API error {e.code}: {e.read().decode(errors='replace')}\n")
+        sys.exit(2)
+
+    if args.json:
+        data["_timestamp"] = ts
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+
+    status = data.get("status")
+    if status != "OK":
+        sys.stderr.write(f"status={status}: {data.get('errorMessage','')}\n")
+        sys.exit(3)
+
+    raw = data.get("rawOffset", 0)
+    dst = data.get("dstOffset", 0)
+    total = raw + dst
+    offh = total / 3600.0
+    sign = "+" if offh >= 0 else "-"
+    local = datetime.fromtimestamp(ts, tz=timezone.utc) + timedelta(seconds=total)
+
+    print(f"{data.get('timeZoneName','?')} ({data.get('timeZoneId','?')})")
+    print(f"UTC{sign}{abs(offh):g}  (raw {raw/3600:g}h + DST {dst/3600:g}h)")
+    print(f"基準UTC : {datetime.fromtimestamp(ts, tz=timezone.utc):%Y-%m-%d %H:%M} UTC")
+    print(f"現地時刻: {local:%Y-%m-%d %H:%M}")
+
+
+if __name__ == "__main__":
+    main()

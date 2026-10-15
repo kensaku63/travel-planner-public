@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""flight-serp — SerpAPI (Google Flights) でフライト検索（fli の信頼性フォールバック）
+
+APIキーは環境変数 SERP_API_KEY から読む（環境変数で設定）。
+片道(type=2)が既定。複数空港は departure をカンマ区切りで可（例: DFW,DAL）。
+
+例:
+  flight-serp DFW DEN 2026-06-27 --nonstop
+  flight-serp DFW,DAL ABQ 2026-06-27 --nonstop --json
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+ENDPOINT = "https://serpapi.com/search.json"
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Google Flights 検索 (SerpAPI)")
+    p.add_argument("departure", help="出発空港 IATA（カンマ区切り可）")
+    p.add_argument("arrival", help="到着空港 IATA（カンマ区切り可）")
+    p.add_argument("date", help="出発日 YYYY-MM-DD")
+    p.add_argument("--nonstop", action="store_true", help="直行のみ")
+    p.add_argument("--currency", default="USD")
+    p.add_argument("--gl", default="us")
+    p.add_argument("--hl", default="en")
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args()
+
+    key = os.environ.get("SERP_API_KEY")
+    if not key:
+        sys.stderr.write("SERP_API_KEY 未設定。利用者自身の環境変数を設定してください。\n")
+        sys.exit(1)
+
+    params = {
+        "engine": "google_flights",
+        "departure_id": args.departure,
+        "arrival_id": args.arrival,
+        "outbound_date": args.date,
+        "type": "2",  # one-way
+        "stops": "1" if args.nonstop else "0",  # 1=nonstop, 0=any
+        "currency": args.currency,
+        "gl": args.gl,
+        "hl": args.hl,
+        "api_key": key,
+    }
+    url = ENDPOINT + "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        data = json.loads(resp.read().decode())
+
+    if "error" in data:
+        sys.stderr.write("SerpAPI error: " + data["error"] + "\n")
+        sys.exit(2)
+
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+
+    groups = (data.get("best_flights", []) or []) + (data.get("other_flights", []) or [])
+    if not groups:
+        print("0 件（直行便なし、または路線なし）")
+        return
+    print(f"{len(groups)} 件\n")
+    for g in groups:
+        segs = g.get("flights", [])
+        nstops = len(segs) - 1
+        first, last = segs[0], segs[-1]
+        dep = first["departure_airport"]
+        arr = last["arrival_airport"]
+        carriers = " / ".join(sorted({s.get("airline", "?") for s in segs}))
+        dur = g.get("total_duration", "?")
+        h, m = divmod(dur, 60) if isinstance(dur, int) else ("?", "?")
+        tag = "直行" if nstops == 0 else f"{nstops}回乗継"
+        print(f"- {g.get('price','?')} {args.currency}  {tag}  {h}h{m}m  {carriers}")
+        print(f"  {dep['id']} {dep['time']} -> {arr['id']} {arr['time']}")
+
+
+if __name__ == "__main__":
+    main()
